@@ -3,10 +3,8 @@ const https = require("https");
 const zlib = require("zlib");
 
 const PORT = process.env.PORT || 3000;
-const CACHE_MS = 5 * 60 * 1000;
 
-let cachedBody = "";
-let cachedAt = 0;
+const cache = new Map();
 
 function readResponse(response) {
 	return new Promise((resolve, reject) => {
@@ -44,12 +42,21 @@ function readResponse(response) {
 	});
 }
 
-function fetchSkinport(currency, tradable) {
-	const upstreamUrl = new URL("https://api.skinport.com/v1/items");
+function buildSkinportUrl(endpoint, currency, tradable) {
+	const upstreamUrl = new URL(endpoint === "out-of-stock"
+		? "https://api.skinport.com/v1/sales/out-of-stock"
+		: "https://api.skinport.com/v1/items");
 	upstreamUrl.searchParams.set("app_id", "730");
 	upstreamUrl.searchParams.set("currency", currency);
-	upstreamUrl.searchParams.set("tradable", tradable);
+	if (endpoint !== "out-of-stock") {
+		upstreamUrl.searchParams.set("tradable", tradable);
+	}
 
+	return upstreamUrl;
+}
+
+function fetchSkinport(endpoint, currency, tradable) {
+	const upstreamUrl = buildSkinportUrl(endpoint, currency, tradable);
 	return new Promise((resolve, reject) => {
 		const req = https.get(upstreamUrl, {
 			headers: {
@@ -79,6 +86,7 @@ function fetchSkinport(currency, tradable) {
 const server = http.createServer(async (req, res) => {
 	try {
 		const url = new URL(req.url, `http://${req.headers.host}`);
+		const endpoint = (url.searchParams.get("endpoint") || "items").toLowerCase();
 		const currency = (url.searchParams.get("currency") || "USD").toUpperCase();
 		const tradable = url.searchParams.get("tradable") || "0";
 
@@ -88,16 +96,28 @@ const server = http.createServer(async (req, res) => {
 			return;
 		}
 
-		if (!cachedBody || Date.now() - cachedAt > CACHE_MS) {
-			cachedBody = await fetchSkinport(currency, tradable);
-			cachedAt = Date.now();
+		if (endpoint !== "items" && endpoint !== "out-of-stock") {
+			res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+			res.end("Unknown endpoint");
+			return;
+		}
+
+		const cacheKey = buildSkinportUrl(endpoint, currency, tradable).toString();
+		const cacheTtl = endpoint === "out-of-stock" ? 60 * 60 * 1000 : 5 * 60 * 1000;
+		let cached = cache.get(cacheKey);
+		if (!cached || Date.now() - cached.at > cacheTtl) {
+			cached = {
+				body: await fetchSkinport(endpoint, currency, tradable),
+				at: Date.now(),
+			};
+			cache.set(cacheKey, cached);
 		}
 
 		res.writeHead(200, {
 			"content-type": "application/json; charset=utf-8",
-			"cache-control": "public, max-age=300",
+			"cache-control": `public, max-age=${Math.floor(cacheTtl / 1000)}`,
 		});
-		res.end(cachedBody);
+		res.end(cached.body);
 	} catch (err) {
 		res.writeHead(502, {
 			"content-type": "text/plain; charset=utf-8",
